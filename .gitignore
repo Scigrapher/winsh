@@ -1,0 +1,5 @@
+bin/
+*.exe
+!*.exe.template
+*.prof
+coverage.out
