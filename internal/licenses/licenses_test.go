@@ -46,9 +46,10 @@ func TestEmbeddedLicenseMatchesLICENSE(t *testing.T) {
 		t.Fatalf("read LICENSE: %v", err)
 	}
 	shipped := strings.ReplaceAll(string(data), "\r\n", "\n")
-	if shipped != GPLv3 {
-		t.Errorf("internal/licenses/gpl-3.0.txt differs from LICENSE: %d bytes vs %d bytes",
-			len(GPLv3), len(shipped))
+	embedded := strings.ReplaceAll(GPLv3, "\r\n", "\n")
+	if shipped != embedded {
+		t.Errorf("internal/licenses/gpl-3.0.txt differs from LICENSE after normalizing line endings: %d bytes vs %d bytes",
+			len(embedded), len(shipped))
 	}
 }
 

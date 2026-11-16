@@ -69,8 +69,8 @@ var Components = []Component{
 // GPLv3 is the license winsh itself is distributed under.  It is compiled in
 // rather than read from disk because winsh.exe ships standalone: --show-licenses
 // has to be able to print the terms from the binary alone.  The test in
-// licenses_test.go keeps this copy byte-identical to the LICENSE file at the
-// top of the source tree.
+// licenses_test.go keeps this copy textually identical to the LICENSE file at
+// the top of the source tree, regardless of checkout line endings.
 //
 //go:embed gpl-3.0.txt
 var GPLv3 string
