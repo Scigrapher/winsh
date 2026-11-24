@@ -203,6 +203,126 @@ func TestReceiverAppliesOutOfOrderChain(t *testing.T) {
 	}
 }
 
+func TestAssemblyCopiesDiffOutOfInflatedBuffer(t *testing.T) {
+	// A tiny diff travelling with a large chaff field used to leave Diff
+	// pointing into the whole inflated instruction, so every retained state
+	// pinned several megabytes even though diffBytes counted a few bytes.
+	chaff := make([]byte, 3000)
+	for i := range chaff {
+		chaff[i] = byte(i)
+	}
+	inst := &ssp.Instruction{
+		ProtocolVersion: ssp.ProtocolVersion, HasProtocol: true,
+		OldNum: 0, HasOldNum: true, NewNum: 1, HasNewNum: true,
+		Diff: []byte("small diff"), HasDiff: true,
+		Chaff: chaff, HasChaff: true,
+	}
+	var fr Fragmenter
+	parts, err := fr.Make(inst, 200)
+	if err != nil {
+		t.Fatalf("Make: %v", err)
+	}
+	var asm Assembly
+	for _, part := range parts {
+		f, err := ParseFragment(part)
+		if err != nil {
+			t.Fatalf("ParseFragment: %v", err)
+		}
+		if _, err := asm.Add(f); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	got, err := asm.Instruction()
+	if err != nil {
+		t.Fatalf("Instruction: %v", err)
+	}
+	if string(got.Diff) != "small diff" {
+		t.Fatalf("diff = %q", got.Diff)
+	}
+	// Go rounds a 10-byte allocation up to a 16-byte size class; what matters
+	// is that the backing array is not the multi-kilobyte inflated buffer.
+	if cap(got.Diff) >= 1024 {
+		t.Fatalf("diff capacity %d for a %d-byte diff; it still pins the inflated buffer", cap(got.Diff), len(got.Diff))
+	}
+}
+
+func TestReceiverPrunesDroppedHistory(t *testing.T) {
+	r := NewReceiver(&listState{})
+	for i := 1; i <= 5000; i++ {
+		inst := testInstruction(uint64(i-1), uint64(i), []byte{byte(i)})
+		inst.ThrowawayNum = uint64(i - 1)
+		inst.HasThrowaway = true
+		ok, err := r.ProcessInstruction(inst)
+		if err != nil || !ok {
+			t.Fatalf("state %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	if len(r.states) > 3 {
+		t.Fatalf("retained %d states after throwaway, want a small window", len(r.states))
+	}
+	if len(r.byNum) != len(r.states) {
+		t.Fatalf("lookup map holds %d states, list holds %d", len(r.byNum), len(r.states))
+	}
+	// Walking the retained ancestry must terminate in the current window.  A
+	// pointer chain used to remain 5000 links deep.
+	cur := r.states[len(r.states)-1]
+	depth := 0
+	for cur.HasParent {
+		next, ok := r.byNum[cur.ParentNum]
+		if !ok {
+			t.Fatalf("retained state %d points at dropped parent %d", cur.Num, cur.ParentNum)
+		}
+		cur = next
+		depth++
+		if depth > 4 {
+			t.Fatalf("ancestry depth %d is not bounded", depth)
+		}
+	}
+}
+
+func TestReceiverBoundsMaterializedSnapshots(t *testing.T) {
+	r := NewReceiver(&listState{})
+	for i := 1; i <= 200; i++ {
+		if ok, err := r.ProcessInstruction(testInstruction(uint64(i-1), uint64(i), []byte{byte(i)})); err != nil || !ok {
+			t.Fatalf("state %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	materialized := 0
+	for _, s := range r.states {
+		if s.S != nil {
+			materialized++
+		}
+	}
+	if materialized > materializedCache+1 {
+		t.Fatalf("%d materialized snapshots retained, limit is %d", materialized, materializedCache+1)
+	}
+}
+
+func TestReceiverBuildsOnReferenceRetiredByThrowaway(t *testing.T) {
+	r := NewReceiver(&listState{})
+	for i := 1; i <= 3; i++ {
+		if ok, err := r.ProcessInstruction(testInstruction(uint64(i-1), uint64(i), []byte("abc"[i-1:i]))); err != nil || !ok {
+			t.Fatalf("state %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	// State 4 builds on state 1 even though the same instruction asks the
+	// receiver to retire everything older than itself.  The reference has to
+	// be snapshotted before throwaway clears it.
+	inst := testInstruction(1, 4, []byte("d"))
+	inst.ThrowawayNum = 4
+	inst.HasThrowaway = true
+	if ok, err := r.ProcessInstruction(inst); err != nil || !ok {
+		t.Fatalf("state 4: ok=%v err=%v", ok, err)
+	}
+	got, num, err := r.Deliver()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if num != 4 || string(got.(*listState).events) != "ad" {
+		t.Fatalf("delivered %d %q, want 4 %q", num, got.(*listState).events, "ad")
+	}
+}
+
 // pair builds a client and a server-shaped connection over loopback sharing
 // one session key, as a real mosh session does.
 func pair(t *testing.T) (client, server *Connection, key moshcrypto.Key) {

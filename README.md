@@ -404,10 +404,13 @@ does not, so a network hiccup cannot end your shell.
 * **Bounded everything.** A hostile server cannot make the client allocate
   without limit: datagrams are capped at 2048 bytes, an inflated stream is
   refused at 4 MiB, retained state diffs at 32 MiB, fragment and field counts
-  are capped, the screen is clamped to 512x512 cells, combining marks to 8 per
+  are capped, discarded state history is released rather than kept alive by
+  parent links, only a small number of received states hold full screen
+  snapshots, the screen is clamped to 512x512 cells, combining marks to 8 per
   glyph, CSI parameters and SSH channel buffers are bounded, titles to 1 KiB,
   agent replies to 1 MiB, and every SSH wire field is bounds-checked before it
-  is read.
+  is read.  The process also sets a 256 MiB soft Go heap limit so a long-lived
+  session has a fixed footprint rather than growing with its history.
 * **No terminal injection from untrusted text.** OSC 0/2 titles, SSH banners,
   server errors, key comments, and other remote text have control and Unicode
   directionality characters escaped before display. OSC 52 (clipboard) is dropped

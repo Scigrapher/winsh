@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -36,6 +37,11 @@ import (
 )
 
 func main() {
+	// The interactive session's live set is dominated by the terminal
+	// emulator and the SSP window.  A soft heap limit keeps that footprint
+	// fixed even if a future change reintroduces a retention bug; it is not a
+	// hard cap, so a legitimate large frame can still be served.
+	debug.SetMemoryLimit(256 << 20)
 	os.Exit(run(os.Args[1:], os.Environ()))
 }
 

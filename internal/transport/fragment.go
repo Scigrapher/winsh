@@ -155,6 +155,14 @@ func (a *Assembly) Instruction() (*ssp.Instruction, error) {
 	if err != nil {
 		return nil, err
 	}
+	// ParseInstruction slices Diff out of the inflated buffer.  Retaining that
+	// slice would pin the whole decompressed instruction (up to
+	// MaxInflatedBytes) for every state in the receiver's window, even when
+	// the diff itself is only a few hundred bytes.  Copy it to an exact-sized
+	// allocation so the inflated buffer can be collected.
+	if inst.HasDiff {
+		inst.Diff = append([]byte(nil), inst.Diff...)
+	}
 	return inst, nil
 }
 

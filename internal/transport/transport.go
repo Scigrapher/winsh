@@ -36,7 +36,11 @@ const (
 	maxReceivedStates    = 1024
 	maxReceiverDiffBytes = 32 << 20
 	receiverQuenchPause  = 15000 * time.Millisecond
-	materializedCache    = 16
+	// materializedCache is the number of newest received states kept as full
+	// screen snapshots.  Every other retained state keeps only its diff.  This
+	// is a memory bound, not a protocol window: a larger value only makes
+	// out-of-order delivery cheaper.
+	materializedCache = 4
 
 	// chaffMax is how many random bytes are appended to an instruction so
 	// that packet sizes leak less about the content.
@@ -519,28 +523,44 @@ func (s *Sender) ProcessAcknowledgmentThrough(ackNum uint64) {
 // ReceivedState is one link in the receiver's chain of terminal states.  Only
 // the states that are actually needed get a materialized copy; older links
 // keep just the diff, which bounds memory on a lossy link.
+//
+// ParentNum is deliberately a number rather than a pointer.  A pointer chain
+// keeps every historical state reachable after it has been dropped from the
+// window, and each of those states may own a full screen snapshot plus the
+// decompressed instruction buffer its Diff points into.  On a long-lived
+// session that is an unbounded leak; numeric links let the garbage collector
+// reclaim discarded history.
 type ReceivedState struct {
 	Timestamp time.Time
 	Num       uint64
-	Parent    *ReceivedState
+	ParentNum uint64
+	HasParent bool
 	Diff      []byte
 	S         State // nil until materialized
 }
 
-// Materialize returns a live copy of this state.
-func (r *ReceivedState) Materialize() (State, error) {
+// materialize returns a live copy of this state, rebuilding it from the
+// nearest retained materialized ancestor when necessary.
+func (r *ReceivedState) materialize(byNum map[uint64]*ReceivedState) (State, error) {
 	if r.S != nil {
 		return r.S.Clone(), nil
 	}
 	// Walk back to the nearest materialized ancestor.
 	var chain []*ReceivedState
 	cur := r
-	for cur != nil && cur.S == nil {
+	for cur.S == nil {
+		if !cur.HasParent {
+			return nil, errors.New("transport: no materialized ancestor for state")
+		}
+		parent, ok := byNum[cur.ParentNum]
+		if !ok || parent == nil {
+			return nil, errors.New("transport: parent state is no longer retained")
+		}
 		chain = append(chain, cur)
-		cur = cur.Parent
-	}
-	if cur == nil {
-		return nil, errors.New("transport: no materialized ancestor for state")
+		cur = parent
+		if len(chain) > maxReceivedStates {
+			return nil, errors.New("transport: state parent chain is too long")
+		}
 	}
 	out := cur.S.Clone()
 	for i := len(chain) - 1; i >= 0; i-- {
@@ -611,6 +631,24 @@ func (r *Receiver) ProcessInstruction(inst *ssp.Instruction) (bool, error) {
 		// replay resistance are enforced.
 		return false, nil
 	}
+
+	// Take a snapshot of the reference before throwaway can discard it.  An
+	// instruction may legitimately build on a state that its own throwaway
+	// number is about to retire; the diff has to be applied to what that state
+	// was, not to a cleared record.
+	lastBefore := r.states[len(r.states)-1]
+	refWillBeDropped := ref.Num < inst.ThrowawayNum && ref != lastBefore
+	var base State
+	if len(inst.Diff) > 0 || refWillBeDropped {
+		var err error
+		base, err = ref.materialize(r.byNum)
+		if err != nil {
+			// The reference's ancestry was pruned.  Treat it like an unknown
+			// reference: ignore the instruction and let SSP retransmit from a
+			// state we still have.
+			return false, nil
+		}
+	}
 	r.processThrowawayUntil(inst.ThrowawayNum)
 
 	if len(r.states) >= maxReceivedStates || r.diffBytes > maxReceiverDiffBytes ||
@@ -621,18 +659,27 @@ func (r *Receiver) ProcessInstruction(inst *ssp.Instruction) (bool, error) {
 		}
 		return false, nil // drop rather than let the queue grow
 	}
-	newState := &ReceivedState{Timestamp: time.Now(), Num: inst.NewNum, Parent: ref, Diff: inst.Diff}
+	newState := &ReceivedState{
+		Timestamp: time.Now(),
+		Num:       inst.NewNum,
+		ParentNum: inst.OldNum,
+		HasParent: true,
+		Diff:      append([]byte(nil), inst.Diff...),
+	}
 	if len(inst.Diff) > 0 {
 		// Materialize the reference, apply the diff, and keep it: this is the
 		// newest state, so it will be needed for rendering immediately.
-		base, err := ref.Materialize()
-		if err != nil {
-			return false, err
-		}
 		if err := base.ApplyString(inst.Diff); err != nil {
 			return false, err
 		}
 		newState.S = base
+	} else if base != nil {
+		// An empty diff means the referenced state and this one are identical.
+		newState.S = base
+	}
+	if _, retained := r.byNum[inst.OldNum]; !retained {
+		newState.HasParent = false
+		newState.ParentNum = 0
 	}
 	r.insertSorted(newState)
 	r.trim()
@@ -656,16 +703,53 @@ func (r *Receiver) processThrowawayUntil(throwaway uint64) {
 	if len(r.states) > 0 {
 		last = r.states[len(r.states)-1]
 	}
+
+	// Work out what survives first, then materialize the new anchor while the
+	// states it depends on are still in byNum.  After the old states are
+	// removed the anchor is self-contained, so no link back into discarded
+	// history remains.
+	var dropped []*ReceivedState
 	kept := r.states[:0]
+	var anchor *ReceivedState
 	for _, s := range r.states {
 		if s.Num < throwaway && s != last {
-			delete(r.byNum, s.Num)
-			r.diffBytes -= len(s.Diff)
+			dropped = append(dropped, s)
 			continue
+		}
+		if anchor == nil {
+			anchor = s
 		}
 		kept = append(kept, s)
 	}
 	r.states = kept
+	if anchor != nil && anchor.S == nil {
+		if st, err := anchor.materialize(r.byNum); err == nil {
+			anchor.S = st
+		}
+	}
+	if anchor != nil && anchor.S != nil {
+		// The anchor no longer needs its ancestors.
+		anchor.HasParent = false
+		anchor.ParentNum = 0
+	}
+
+	// The newest state must always be deliverable.  If an empty-diff state
+	// depended on a parent that is about to disappear, freeze it now.
+	if last != nil && last.S == nil {
+		if st, err := last.materialize(r.byNum); err == nil {
+			last.S = st
+			last.HasParent = false
+			last.ParentNum = 0
+		}
+	}
+	for _, s := range dropped {
+		delete(r.byNum, s.Num)
+		r.diffBytes -= len(s.Diff)
+		s.S = nil
+		s.Diff = nil
+		s.HasParent = false
+		s.ParentNum = 0
+	}
 	if len(r.states) == 0 {
 		// Never empty the queue: the newest state is always usable.
 		if last != nil {
@@ -677,15 +761,32 @@ func (r *Receiver) processThrowawayUntil(throwaway uint64) {
 
 // trim unmaterializes interior states so memory stays bounded.  The oldest
 // kept state stays materialized: it is the anchor every other state is
-// rebuilt from, and diffs are never discarded, so a state can always be
-// reconstructed exactly.
+// rebuilt from, and diffs are never discarded.  A snapshot is only dropped
+// when an ancestor snapshot is still reachable; otherwise the state keeps its
+// full screen because it is no longer reconstructible.
 func (r *Receiver) trim() {
 	if len(r.states) <= materializedCache+1 {
 		return
 	}
 	for i := 1; i < len(r.states)-materializedCache; i++ {
-		r.states[i].S = nil
+		s := r.states[i]
+		if s.S != nil && s.HasParent && r.hasMaterializedAncestor(s) {
+			s.S = nil
+		}
 	}
+}
+
+// hasMaterializedAncestor reports whether s can be rebuilt after its own
+// snapshot is dropped.
+func (r *Receiver) hasMaterializedAncestor(s *ReceivedState) bool {
+	cur, ok := r.byNum[s.ParentNum]
+	for steps := 0; ok && steps < maxReceivedStates; steps++ {
+		if cur.S != nil {
+			return true
+		}
+		cur, ok = r.byNum[cur.ParentNum]
+	}
+	return false
 }
 
 // Deliver returns the newest materialized state and records it as delivered,
@@ -695,7 +796,7 @@ func (r *Receiver) Deliver() (State, uint64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	s, err := latest.Materialize()
+	s, err := latest.materialize(r.byNum)
 	if err != nil {
 		return nil, 0, err
 	}
