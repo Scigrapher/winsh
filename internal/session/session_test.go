@@ -3,6 +3,7 @@ package session_test
 import (
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -138,6 +139,16 @@ func screenText(t *testing.T, cl *session.Client) string {
 	return strings.Join(rows, "\n")
 }
 
+// localPort reports the connection's current local port.  LocalAddr can be
+// nil when the connection has no socket, so the test tolerates that rather
+// than dereferencing it.
+func localPort(conn *transport.Connection) int {
+	if a := conn.LocalAddr(); a != nil {
+		return a.Port
+	}
+	return 0
+}
+
 // TestSessionEchoRoundTrip is the end-to-end test: keystrokes travel to the
 // server through SSP, come back as rendered terminal output, and appear on the
 // client's screen.
@@ -226,12 +237,12 @@ func TestReconnectAfterRedial(t *testing.T) {
 	waitFor(t, "pre-detach echo", func() bool {
 		return strings.Contains(screenText(t, cl), "before")
 	})
-	portBefore := conn.LocalAddr().Port
+	portBefore := localPort(conn)
 
 	// Ctrl-^ then Ctrl-Z, on a fresh line: the detach sequence.
 	cl.PushInput([]byte{0x1E, 0x1A})
 	waitFor(t, "the socket to be re-dialed", func() bool {
-		return conn.LocalAddr().Port != portBefore
+		return localPort(conn) != portBefore
 	})
 
 	// Enter reattaches.
@@ -248,13 +259,13 @@ func TestReconnectAfterRedial(t *testing.T) {
 	// The bound is generous compared to the measured round trip (~60 ms over
 	// loopback) but far tighter than the one-second timer floor that used to
 	// mask the stall.
-	txBefore := conn.TxTotal
+	txBefore := atomic.LoadUint64(&conn.TxTotal)
 	sent := make(chan time.Duration, 1)
 	go func() {
 		t0 := time.Now()
 		cl.PushInput([]byte("after\r"))
 		for time.Now().Before(t0.Add(5 * time.Second)) {
-			if conn.TxTotal > txBefore {
+			if atomic.LoadUint64(&conn.TxTotal) > txBefore {
 				sent <- time.Since(t0)
 				return
 			}
@@ -269,8 +280,9 @@ func TestReconnectAfterRedial(t *testing.T) {
 	waitFor(t, "post-redial echo", func() bool {
 		return strings.Contains(screenText(t, cl), "after")
 	})
-	if !srv.ConnRoamedTo(conn.LocalAddr()) {
-		t.Fatalf("server did not roam to the re-dialed client address %s", conn.LocalAddr())
+	addr := conn.LocalAddr()
+	if addr == nil || !srv.ConnRoamedTo(addr) {
+		t.Fatalf("server did not roam to the re-dialed client address %v", addr)
 	}
 }
 

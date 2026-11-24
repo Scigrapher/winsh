@@ -749,10 +749,10 @@ func (c *Client) detach() {
 		c.con.Restore()
 	}
 	c.emitBytes([]byte("\r\n[winsh is detached.]\r\nPress Enter to reconnect...\r\n"))
-	if err := c.tr.Conn.Redial(); err != nil && c.opt.Verbose {
-		fmt.Fprintf(os.Stderr, "winsh: redial: %v\n", err)
-	}
-	// Drain queued events, then block for a line of input.
+	// Discard anything typed before the detach took effect.  This has to happen
+	// before the redial: once the new socket is visible, callers may legitimately
+	// send the Enter that reattaches, and draining afterwards would throw that
+	// keystroke away and leave the session waiting for a second one.
 	for {
 		select {
 		case <-c.events:
@@ -760,6 +760,9 @@ func (c *Client) detach() {
 		default:
 		}
 		break
+	}
+	if err := c.tr.Conn.Redial(); err != nil && c.opt.Verbose {
+		fmt.Fprintf(os.Stderr, "winsh: redial: %v\n", err)
 	}
 	deadline := time.After(30 * time.Second)
 	for {

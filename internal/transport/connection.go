@@ -212,7 +212,10 @@ func (c *Connection) SetRemote(a *net.UDPAddr) {
 	c.mu.Unlock()
 }
 
-// LocalAddr returns the local address of the socket the connection sends from.
+// LocalAddr returns the local address of the socket the connection sends
+// from.  It returns nil when the connection has no socket: after Close, or
+// briefly while a pinned-port Redial rebinds.  An ordinary ephemeral-port
+// redial swaps sockets atomically, so callers never see a transient nil then.
 func (c *Connection) LocalAddr() *net.UDPAddr {
 	s := c.currentSocket()
 	if s == nil || s.conn == nil {
@@ -268,7 +271,10 @@ func (c *Connection) LastRoundtripSuccess() time.Time { return c.lastRoundtripSu
 // SetLastRoundtripSuccess records an acknowledged round trip.
 func (c *Connection) SetLastRoundtripSuccess(t time.Time) { c.lastRoundtripSuccess = t }
 
-func (c *Connection) addSocket() (*socket, error) {
+// listenSocket binds a new UDP socket without publishing it.  Keeping the bind
+// separate lets Redial open the replacement before retiring the old socket, so
+// readers never observe an empty socket list.
+func (c *Connection) listenSocket() (*socket, error) {
 	var addr *net.UDPAddr
 	if c.opts.LocalPort != 0 || c.opts.BindIP != "" {
 		addr = &net.UDPAddr{IP: net.ParseIP(c.opts.BindIP), Port: c.opts.LocalPort}
@@ -280,15 +286,28 @@ func (c *Connection) addSocket() (*socket, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: listen udp: %w", err)
 	}
+	return &socket{conn: conn, created: time.Now()}, nil
+}
+
+// deriveMTULocked fills in the datagram budget from the socket's address
+// family.  The caller must hold c.mu.
+func (c *Connection) deriveMTULocked(s *socket) {
 	if c.mtu == 0 {
-		if ip := conn.LocalAddr().(*net.UDPAddr).IP; ip.To4() != nil {
+		if ip := s.conn.LocalAddr().(*net.UDPAddr).IP; ip.To4() != nil {
 			c.mtu = defaultIPv4MTU
 		} else {
 			c.mtu = defaultIPv6MTU
 		}
 	}
-	s := &socket{conn: conn, created: time.Now()}
+}
+
+func (c *Connection) addSocket() (*socket, error) {
+	s, err := c.listenSocket()
+	if err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
+	c.deriveMTULocked(s)
 	c.sockets = append(c.sockets, s)
 	c.lastPortChoice = time.Now()
 	if len(c.sockets) > maxPortsOpen {
@@ -587,21 +606,44 @@ func (c *Connection) Close() error {
 // "reconnect" would be rejected as replay.  This is also what port hopping
 // uses.
 func (c *Connection) Redial() error {
+	// Bind the replacement before retiring the old sockets.  Removing the old
+	// set first leaves currentSocket returning nil for the duration of the
+	// bind, which lets concurrent LocalAddr callers dereference nil and can
+	// even let the OS hand the old ephemeral port straight back to us.
+	s, err := c.listenSocket()
+	if err != nil {
+		// A pinned local port cannot be rebound while the old socket owns it.
+		// Release the old set and retry, preserving the previous behaviour for
+		// that explicitly configured case.
+		if c.opts.LocalPort == 0 {
+			return err
+		}
+		c.mu.Lock()
+		old := c.sockets
+		c.sockets = nil
+		c.mu.Unlock()
+		for _, o := range old {
+			o.Close()
+		}
+		if s, err = c.listenSocket(); err != nil {
+			return err
+		}
+	}
+
 	c.mu.Lock()
-	old := c.sockets
-	c.sockets = nil
-	c.mu.Unlock()
-	for _, s := range old {
+	if c.closed {
+		c.mu.Unlock()
 		s.Close()
+		return errors.New("transport: redial on closed connection")
 	}
-	// Clear the MTU first: addSocket derives it from the new socket's address
-	// family, and a stale or zero value would break fragment sizing.
-	c.mtu = 0
-	if _, err := c.addSocket(); err != nil {
-		return err
+	old := c.sockets
+	c.deriveMTULocked(s)
+	c.sockets = []*socket{s}
+	c.lastPortChoice = time.Now()
+	c.mu.Unlock()
+	for _, o := range old {
+		o.Close()
 	}
-	if c.currentSocket() == nil {
-		return errors.New("transport: redial left no socket")
-	}
+	go c.readLoop(s)
 	return nil
 }

@@ -390,6 +390,30 @@ func TestTransportConvergesOverLoopback(t *testing.T) {
 	}
 }
 
+func TestRedialRebindsToFreshLocalPort(t *testing.T) {
+	cc, sc, _ := pair(t)
+	defer cc.Close()
+	defer sc.Close()
+
+	prev := cc.LocalAddr()
+	if prev == nil {
+		t.Fatal("client has no initial local address")
+	}
+	for i := 0; i < 10; i++ {
+		if err := cc.Redial(); err != nil {
+			t.Fatalf("redial %d: %v", i, err)
+		}
+		cur := cc.LocalAddr()
+		if cur == nil {
+			t.Fatalf("redial %d left the connection without a local address", i)
+		}
+		if cur.Port == prev.Port {
+			t.Fatalf("redial %d reused local port %d", i, cur.Port)
+		}
+		prev = cur
+	}
+}
+
 func TestTransportRecoversFromDroppedPackets(t *testing.T) {
 	cc, sc, _ := pair(t)
 	defer cc.Close()
